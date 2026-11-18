@@ -399,6 +399,78 @@ async function convertHosted(req, res, mediaUrl, meta, durationHint) {
   }
 }
 
+// One yt-dlp attempt: download, then verify the file actually has an audio
+// stream. Instagram sometimes hands a datacenter IP a video-only file, which
+// ffmpeg cannot turn into audio — that must count as a failed attempt, not a
+// success. Returns { result } on success, { blocked } when Instagram says
+// the reel is restricted, or { error } / { noAudio } otherwise.
+async function tryExtract(reelUrl, id, extraArgs, timeoutMs, blockTask) {
+  const job = startExtract(reelUrl, id, extraArgs, timeoutMs);
+  try {
+    const first = await Promise.race([
+      blockTask.then((reason) => ({ kind: 'block', reason })),
+      job.promise.then((result) => ({ kind: 'file', result })),
+    ]);
+    if (first.kind === 'block' && first.reason) {
+      job.stop();
+      job.promise.catch(() => {});
+      cleanupPartial(id);
+      return { blocked: first.reason };
+    }
+    const result = first.kind === 'file' ? first.result : await job.promise;
+    const probe = await probeFile(path.join(FILES_DIR, result.file));
+    if (!probe.codec) {
+      console.error('[audio] downloaded file has no audio stream:', result.file);
+      cleanupPartial(id);
+      return { noAudio: true };
+    }
+    return { result };
+  } catch (e) {
+    job.stop();
+    job.promise.catch(() => {});
+    cleanupPartial(id);
+    return { error: e };
+  }
+}
+
+// Progressive combined mp4 (Instagram's video_versions): one file with video
+// + audio. Used when the manifest Render gets has no separate audio stream.
+// Picks the file from yt-dlp's own metadata, downloads it directly, and
+// verifies it has an audio stream before returning it.
+async function progressiveAudio(reelUrl, id) {
+  const meta = await new Promise((resolve, reject) => {
+    execFile(YTDLP, ['-j', '--no-warnings', '--socket-timeout', '10', '--retries', '1', reelUrl], { timeout: 30000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+    });
+  });
+  const formats = Array.isArray(meta.formats) ? meta.formats : [];
+  const seen = new Set();
+  const candidates = formats.filter((f) => {
+    if (!/^\d+$/.test(String(f.format_id)) || f.ext !== 'mp4' || typeof f.url !== 'string') return false;
+    if (!allowedMediaHost(f.url) || seen.has(f.url)) return false;
+    seen.add(f.url);
+    return true;
+  });
+  for (const cand of candidates) {
+    const dest = path.join(FILES_DIR, id + '.mp4');
+    try {
+      await downloadToFile(cand.url, dest);
+      const probe = await probeFile(dest);
+      if (!probe.codec) {
+        console.error('[audio] progressive file has no audio stream');
+        fs.unlink(dest, () => {});
+        continue;
+      }
+      return { file: id + '.mp4', info: meta };
+    } catch (e) {
+      console.error('[audio] progressive download failed:', e.message);
+      fs.unlink(dest, () => {});
+    }
+  }
+  return null;
+}
+
 async function handleAudio(req, res) {
   const reelUrl = cleanInstagramUrl(getInputUrl(req));
   if (!isInstagramUrl(reelUrl)) {
@@ -443,38 +515,43 @@ async function handleAudio(req, res) {
   const id = crypto.randomBytes(8).toString('hex');
   const audioFormat = ['-f', 'ba[ext=m4a]/bestaudio[ext=m4a]/bestaudio/best'];
   const blockTask = instagramBlockReason(reelUrl);
-  const job = startExtract(reelUrl, id, audioFormat, 60000);
   let extracted = null;
+  let blockedReason = null;
 
-  try {
-    const first = await Promise.race([
-      blockTask.then((reason) => ({ kind: 'block', reason })),
-      job.promise.then((result) => ({ kind: 'file', result })),
-    ]);
-    if (first.kind === 'block' && first.reason) {
-      job.stop();
-      job.promise.catch(() => {});
-      cleanupPartial(id);
-      return res.status(400).json({ success: false, message: first.reason });
-    }
-    extracted = first.kind === 'file' ? first.result : await job.promise;
-  } catch (e) {
-    job.stop();
-    job.promise.catch(() => {});
-    cleanupPartial(id);
-    console.error('[audio] fast attempt failed:', e.message);
-    const reason = await blockTask;
-    if (reason) return res.status(400).json({ success: false, message: reason });
+  // 1) Normal audio-only download (works when Instagram serves the audio stream).
+  const fast = await tryExtract(reelUrl, id, audioFormat, 60000, blockTask);
+  if (fast.blocked) blockedReason = fast.blocked;
+  else if (fast.result) extracted = fast.result;
+  else console.error('[audio] fast attempt failed:', fast.error ? fast.error.message : 'no audio stream');
+
+  // 2) Progressive combined mp4 — the file Instagram ships with video + audio
+  // in one piece. This is the path that works when the manifest Render gets
+  // has no separate audio stream (common for music reels).
+  if (!extracted && !blockedReason) {
     try {
-      extracted = await startExtract(reelUrl, id, ['--impersonate', 'Chrome-136'].concat(audioFormat), 60000).promise;
-    } catch (e2) {
-      cleanupPartial(id);
-      console.error('[audio] impersonate attempt failed:', e2.message);
-      return res.status(500).json({
-        success: false,
-        message: 'Could not extract audio from this link. It may be private, removed, age-limited, or Instagram is busy right now. Please try another public reel.',
-      });
+      extracted = await progressiveAudio(reelUrl, id);
+      if (extracted) console.log('[audio] progressive mp4 worked for', reelUrl);
+    } catch (e) {
+      console.error('[audio] progressive failed:', e.message);
     }
+  }
+
+  // 3) Last resort: browser-impersonated audio-only download.
+  if (!extracted && !blockedReason) {
+    const imp = await tryExtract(reelUrl, id, ['--impersonate', 'Chrome-136'].concat(audioFormat), 60000, blockTask);
+    if (imp.blocked) blockedReason = imp.blocked;
+    else if (imp.result) extracted = imp.result;
+    else console.error('[audio] impersonate attempt failed:', imp.error ? imp.error.message : 'no audio stream');
+  }
+
+  if (!extracted) {
+    const reason = blockedReason || await blockTask;
+    if (reason) return res.status(400).json({ success: false, message: reason });
+    cleanupPartial(id);
+    return res.status(500).json({
+      success: false,
+      message: 'Could not extract audio from this link. It may be private, removed, age-limited, or Instagram is busy right now. Please try another public reel.',
+    });
   }
 
   try {
